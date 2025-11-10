@@ -27,6 +27,15 @@ def parse_vec3(value: str) -> np.ndarray:
     return np.array(parts, dtype=np.float32)
 
 
+def prepare_observation(obs: np.ndarray, obs_type: ObservationType) -> np.ndarray:
+    if obs_type == ObservationType.RGB:
+        if obs.ndim == 3:
+            return np.ascontiguousarray(np.transpose(obs, (2, 0, 1)))
+        if obs.ndim == 4:
+            return np.ascontiguousarray(np.transpose(obs, (0, 3, 1, 2)))
+    return obs
+
+
 def run_episode(
     model: DQN,
     env: PointToPointAviary,
@@ -43,12 +52,15 @@ def run_episode(
             colab=False,
         )
 
-    obs, _ = env.reset()
+    raw_obs, info = env.reset()
+    print(f"[INFO] Direction hint: {info.get('direction_hint')} (index {info.get('direction_hint_index')})")
+    obs = prepare_observation(raw_obs, env.OBS_TYPE)
     start_wall = time.time()
 
     for step in range(env._max_episode_steps + env.CTRL_FREQ * 2):
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = env.step(action)
+        raw_obs, reward, terminated, truncated, info = env.step(action)
+        obs = prepare_observation(raw_obs, env.OBS_TYPE)
 
         if env.OBS_TYPE == ObservationType.KIN and logger is not None:
             drone_state = env._getDroneStateVector(0)
@@ -81,6 +93,14 @@ def main(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Model file not found: {args.model_path}")
 
     model = DQN.load(args.model_path)
+    obs_choice = args.obs_type.lower()
+    if obs_choice not in {"kin", "rgb"}:
+        raise ValueError("obs_type must be either 'kin' or 'rgb'")
+    obs_enum = ObservationType.RGB if obs_choice == "rgb" else ObservationType.KIN
+
+    snapshot_dir = args.snapshot_dir
+    if snapshot_dir:
+        snapshot_dir = os.path.abspath(snapshot_dir)
 
     for episode in range(args.episodes):
         seed = None if args.seed is None else args.seed + episode
@@ -104,7 +124,10 @@ def main(args: argparse.Namespace) -> None:
             max_xy=args.max_xy,
             max_z=args.max_z,
             target_tolerance=args.target_tolerance,
+             obs=obs_enum,
+            ctrl_freq=24 if obs_enum == ObservationType.RGB else 30,
             use_built_in_obstacles=args.built_in_obstacles,
+            success_snapshot_dir=snapshot_dir,
             seed=seed,
             record=args.record_video or args.record_frames,
         )
@@ -159,6 +182,10 @@ if __name__ == "__main__":
                         help="Distance threshold for considering the goal reached (meters)")
     parser.add_argument("--built_in_obstacles", type=utils_str2bool, default=True,
                         help="Enable the default PyBullet obstacle set")
+    parser.add_argument("--obs_type", type=str, default="kin", choices=["kin", "rgb"],
+                        help="Observation modality to match the trained policy")
+    parser.add_argument("--snapshot_dir", type=str, default=None,
+                        help="Directory to store goal snapshots (RGB only)")
     parser.add_argument("--record_video", type=utils_str2bool, default=False,
                         help="Enable PyBullet third-person MP4 recording")
     parser.add_argument("--record_frames", type=utils_str2bool, default=False,

@@ -603,17 +603,20 @@ class BaseAviary(gym.Env):
                                                       farVal=1000.0
                                                       )
         SEG_FLAG = p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX if segmentation else p.ER_NO_SEGMENTATION_MASK
-        [w, h, rgb, dep, seg] = p.getCameraImage(width=self.IMG_RES[0],
-                                                 height=self.IMG_RES[1],
-                                                 shadow=1,
-                                                 viewMatrix=DRONE_CAM_VIEW,
-                                                 projectionMatrix=DRONE_CAM_PRO,
-                                                 flags=SEG_FLAG,
-                                                 physicsClientId=self.CLIENT
-                                                 )
-        rgb = np.reshape(rgb, (h, w, 4))
-        dep = np.reshape(dep, (h, w))
-        seg = np.reshape(seg, (h, w))
+        renderer = p.ER_BULLET_HARDWARE_OPENGL if self.GUI else p.ER_TINY_RENDERER
+        [w, h, rgb, dep, seg] = p.getCameraImage(
+            width=self.IMG_RES[0],
+            height=self.IMG_RES[1],
+            shadow=1,
+            viewMatrix=DRONE_CAM_VIEW,
+            projectionMatrix=DRONE_CAM_PRO,
+            flags=SEG_FLAG,
+            renderer=renderer,
+            physicsClientId=self.CLIENT,
+        )
+        rgb = np.reshape(np.asarray(rgb, dtype=np.uint8), (h, w, 4))
+        dep = np.reshape(np.asarray(dep), (h, w))
+        seg = np.reshape(np.asarray(seg), (h, w))
         return rgb, dep, seg
 
     ################################################################################

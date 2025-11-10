@@ -1,9 +1,11 @@
 import math
+import os
 from typing import Optional, Tuple
 
 import numpy as np
 import pybullet as p
 from gymnasium import spaces
+from PIL import Image
 
 from gym_pybullet_drones.envs.BaseAviary import BaseAviary
 from gym_pybullet_drones.envs.BaseRLAviary import BaseRLAviary
@@ -36,10 +38,11 @@ class PointToPointAviary(BaseRLAviary):
         min_start_target_separation: float = 0.3,
         velocity_scale: float = 1.5,
         use_built_in_obstacles: bool = False,
+        success_snapshot_dir: Optional[str] = None,
         seed: Optional[int] = None,
     ) -> None:
-        if obs != ObservationType.KIN:
-            raise ValueError("PointToPointAviary currently supports ObservationType.KIN only")
+        if obs not in (ObservationType.KIN, ObservationType.RGB):
+            raise ValueError("PointToPointAviary supports ObservationType.KIN or ObservationType.RGB")
         if ctrl_freq <= 0 or pyb_freq % ctrl_freq != 0:
             raise ValueError("pyb_freq must be a positive multiple of ctrl_freq")
         if target_tolerance <= 0:
@@ -72,7 +75,7 @@ class PointToPointAviary(BaseRLAviary):
             10: np.array([-1.0, -1.0, 0.0, 1.0], dtype=np.float32),
         }
         self._num_actions = len(self._discrete_actions)
-        self._obs_dim = 15
+        self._obs_dim = 15 if obs == ObservationType.KIN else None
         self._velocity_penalty_gain = 0.05
         self._control_penalty_gain = 0.02
         self._progress_gain = 20.0
@@ -90,6 +93,27 @@ class PointToPointAviary(BaseRLAviary):
         self._target_marker_color = (0.85, 0.1, 0.1, 0.9)
         self._marker_bodies: list[int] = []
         self._marker_debug_ids: list[int] = []
+        self._hint_dim = 8
+        self._direction_names = [
+            "east",
+            "northeast",
+            "north",
+            "northwest",
+            "west",
+            "southwest",
+            "south",
+            "southeast",
+        ]
+        self._direction_hint_index = 0
+        self._direction_hint_label = self._direction_names[self._direction_hint_index]
+        self._direction_hint_one_hot = np.zeros(self._hint_dim, dtype=np.float32)
+        self._direction_hint_planes: Optional[np.ndarray] = None
+        self._success_snapshot_dir = success_snapshot_dir
+        self._episode_counter = 0
+        self._captured_snapshot = False
+        self._last_snapshot_path: Optional[str] = None
+        self._last_rgb_frame: Optional[np.ndarray] = None
+        self._instance_tag = format(id(self) & 0xFFFFFFFF, "x")
         self._manual_target = target_position is not None
         self._target_position = (
             np.array(target_position, dtype=np.float32)
@@ -135,13 +159,24 @@ class PointToPointAviary(BaseRLAviary):
         self._target_position = target
         self.INIT_XYZS = np.tile(self._start_position, (self.NUM_DRONES, 1))
         self._last_action = np.zeros((self.NUM_DRONES, self._action_dim), dtype=np.float32)
+        self._episode_counter += 1
+        self._captured_snapshot = False
+        self._last_snapshot_path = None
+        self._last_rgb_frame = None
+        self._update_direction_hint()
         obs, info = super().reset(seed=seed, options=options)
         self._clear_markers()
         self._spawn_markers()
         self._last_distance = self._distance_to_target()
         self._prev_distance = self._last_distance
         info = dict(info)
-        info.update({"target_position": self._target_position.copy(), "distance_to_target": float(self._last_distance)})
+        info.update({
+            "target_position": self._target_position.copy(),
+            "distance_to_target": float(self._last_distance),
+            "direction_hint": self._direction_hint_label,
+            "direction_hint_index": int(self._direction_hint_index),
+            "snapshot_path": self._last_snapshot_path,
+        })
         return obs, info
 
     def step(self, action):
@@ -160,6 +195,9 @@ class PointToPointAviary(BaseRLAviary):
             "distance_to_target": float(self._last_distance),
             "action_index": action_index,
             "elapsed_steps": self._elapsed_steps,
+            "direction_hint": self._direction_hint_label,
+            "direction_hint_index": int(self._direction_hint_index),
+            "snapshot_path": self._last_snapshot_path,
         })
         return obs, reward, bool(terminated), bool(truncated), info
 
@@ -170,73 +208,102 @@ class PointToPointAviary(BaseRLAviary):
         return spaces.Discrete(self._num_actions)
 
     def _observationSpace(self):
-        pos_bound_xy = self._max_xy * 2.0
-        pos_bound_z = self._max_z
-        dist_bound = math.sqrt((2 * self._max_xy) ** 2 + self._max_z ** 2)
-        low_single = np.array(
-            [
-                -pos_bound_xy,
-                -pos_bound_xy,
-                -pos_bound_z,
-                -self._velocity_limit,
-                -self._velocity_limit,
-                -self._velocity_limit,
-                -math.pi,
-                -math.pi,
-                -math.pi,
-                -1.0,
-                -1.0,
-                -1.0,
-                -1.0,
-                0.0,
-                0.0,
-            ],
-            dtype=np.float32,
-        )
-        high_single = np.array(
-            [
-                pos_bound_xy,
-                pos_bound_xy,
-                pos_bound_z,
-                self._velocity_limit,
-                self._velocity_limit,
-                self._velocity_limit,
-                math.pi,
-                math.pi,
-                math.pi,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                dist_bound,
-                1.0,
-            ],
-            dtype=np.float32,
-        )
-        low = np.tile(low_single, (self.NUM_DRONES, 1))
-        high = np.tile(high_single, (self.NUM_DRONES, 1))
-        return spaces.Box(low=low, high=high, dtype=np.float32)
+        if self.OBS_TYPE == ObservationType.KIN:
+            pos_bound_xy = self._max_xy * 2.0
+            pos_bound_z = self._max_z
+            dist_bound = math.sqrt((2 * self._max_xy) ** 2 + self._max_z ** 2)
+            low_single = np.array(
+                [
+                    -pos_bound_xy,
+                    -pos_bound_xy,
+                    -pos_bound_z,
+                    -self._velocity_limit,
+                    -self._velocity_limit,
+                    -self._velocity_limit,
+                    -math.pi,
+                    -math.pi,
+                    -math.pi,
+                    -1.0,
+                    -1.0,
+                    -1.0,
+                    -1.0,
+                    0.0,
+                    0.0,
+                ],
+                dtype=np.float32,
+            )
+            high_single = np.array(
+                [
+                    pos_bound_xy,
+                    pos_bound_xy,
+                    pos_bound_z,
+                    self._velocity_limit,
+                    self._velocity_limit,
+                    self._velocity_limit,
+                    math.pi,
+                    math.pi,
+                    math.pi,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    dist_bound,
+                    1.0,
+                ],
+                dtype=np.float32,
+            )
+            low = np.tile(low_single, (self.NUM_DRONES, 1))
+            high = np.tile(high_single, (self.NUM_DRONES, 1))
+            return spaces.Box(low=low, high=high, dtype=np.float32)
+
+        height = int(self.IMG_RES[1])
+        width = int(self.IMG_RES[0])
+        channels = 4 + self._hint_dim
+        return spaces.Box(low=0, high=255, shape=(height, width, channels), dtype=np.uint8)
 
     def _computeObs(self):
-        obs = np.zeros((self.NUM_DRONES, self._obs_dim), dtype=np.float32)
-        remaining_ratio = 1.0 - (self._elapsed_steps / max(1, self._max_episode_steps))
+        if self.OBS_TYPE == ObservationType.KIN:
+            obs = np.zeros((self.NUM_DRONES, self._obs_dim), dtype=np.float32)
+            remaining_ratio = 1.0 - (self._elapsed_steps / max(1, self._max_episode_steps))
+            for i in range(self.NUM_DRONES):
+                state = self._getDroneStateVector(i)
+                position = state[0:3]
+                velocity = state[10:13]
+                rpy = state[7:10]
+                error = self._target_position - position
+                distance = np.linalg.norm(error)
+                obs[i, :] = np.hstack(
+                    [
+                        error,
+                        velocity,
+                        rpy,
+                        self._last_action[i],
+                        np.array([distance, max(0.0, remaining_ratio)], dtype=np.float32),
+                    ]
+                )
+            return obs.astype(np.float32)
+
+        base_images = super()._computeObs()
+        if base_images.dtype != np.uint8:
+            base_images_uint8 = np.clip(base_images, 0, 255).astype(np.uint8)
+        else:
+            base_images_uint8 = base_images
+
+        height = int(self.IMG_RES[1])
+        width = int(self.IMG_RES[0])
+        channels = 4 + self._hint_dim
+        images = np.zeros((self.NUM_DRONES, height, width, channels), dtype=np.uint8)
+        hint_planes = self._direction_hint_planes
+        if hint_planes is None:
+            hint_value = (self._direction_hint_one_hot * 255.0).astype(np.uint8)
+            hint_planes = np.tile(hint_value, (height, width, 1))
         for i in range(self.NUM_DRONES):
-            state = self._getDroneStateVector(i)
-            position = state[0:3]
-            velocity = state[10:13]
-            rpy = state[7:10]
-            error = self._target_position - position
-            distance = np.linalg.norm(error)
-            obs[i, :] = np.hstack(
-                [
-                    error,
-                    velocity,
-                    rpy,
-                    self._last_action[i],
-                    np.array([distance, max(0.0, remaining_ratio)], dtype=np.float32),
-                ]
-            )
-        return obs.astype(np.float32)
+            rgb_uint8 = base_images_uint8[i]
+            images[i, :, :, :4] = rgb_uint8
+            images[i, :, :, 4:] = hint_planes
+            if i == 0:
+                self._last_rgb_frame = rgb_uint8[:, :, :3].copy()
+        return images
 
     def _computeReward(self):
         state = self._getDroneStateVector(0)
@@ -249,6 +316,7 @@ class PointToPointAviary(BaseRLAviary):
         reward -= self._control_penalty_gain * np.linalg.norm(self._last_action[0, :3])
         reward -= self._step_penalty
         if self._is_success(distance):
+            self._maybe_capture_goal_snapshot()
             reward += self._success_bonus
         if self._is_crash(position, state[7:10]):
             reward -= self._crash_penalty
@@ -271,7 +339,13 @@ class PointToPointAviary(BaseRLAviary):
         return False
 
     def _computeInfo(self):
-        return {"target_position": self._target_position.copy(), "distance_to_target": float(self._last_distance)}
+        return {
+            "target_position": self._target_position.copy(),
+            "distance_to_target": float(self._last_distance),
+            "direction_hint": self._direction_hint_label,
+            "direction_hint_index": int(self._direction_hint_index),
+            "snapshot_path": self._last_snapshot_path,
+        }
 
     def _preprocessAction(self, action):
         return super()._preprocessAction(action)
@@ -296,6 +370,69 @@ class PointToPointAviary(BaseRLAviary):
         y = self._rng.uniform(-self._max_xy * 0.8, self._max_xy * 0.8)
         z = self._rng.uniform(z_min, self._max_z * 0.9)
         return np.array([x, y, z], dtype=np.float32)
+
+    def _update_direction_hint(self) -> None:
+        vec = self._target_position[:2] - self._start_position[:2]
+        if np.linalg.norm(vec) < 1e-6:
+            index = 0
+        else:
+            angle = math.atan2(vec[1], vec[0])
+            angle = (angle + 2.0 * math.pi) % (2.0 * math.pi)
+            sector = (2.0 * math.pi) / self._hint_dim
+            index = int(math.floor((angle + sector / 2.0) / sector)) % self._hint_dim
+        self._direction_hint_index = index
+        self._direction_hint_one_hot = np.zeros(self._hint_dim, dtype=np.float32)
+        self._direction_hint_one_hot[self._direction_hint_index] = 1.0
+        self._direction_hint_label = self._direction_names[self._direction_hint_index]
+        if self.OBS_TYPE == ObservationType.RGB:
+            value = (self._direction_hint_one_hot * 255.0).astype(np.uint8)
+            height = int(self.IMG_RES[1])
+            width = int(self.IMG_RES[0])
+            self._direction_hint_planes = np.tile(value, (height, width, 1))
+        else:
+            self._direction_hint_planes = None
+
+    def _maybe_capture_goal_snapshot(self) -> None:
+        if (
+            self._success_snapshot_dir is None
+            or self._captured_snapshot
+            or self.OBS_TYPE != ObservationType.RGB
+        ):
+            return
+
+        if self.rgb is None or len(self.rgb) == 0:
+            return
+
+        image_array = self._last_rgb_frame if self._last_rgb_frame is not None else self.rgb[0]
+        if image_array is None:
+            return
+
+        os.makedirs(self._success_snapshot_dir, exist_ok=True)
+        filename = f"env-{self._instance_tag}_ep{self._episode_counter:05d}_step{self._elapsed_steps:05d}.png"
+        filepath = os.path.join(self._success_snapshot_dir, filename)
+
+        if image_array.ndim == 2:
+            rgb_image = np.repeat(image_array[:, :, np.newaxis], 3, axis=2)
+        elif image_array.shape[-1] >= 3:
+            rgb_image = image_array[:, :, :3]
+        else:
+            rgb_image = np.repeat(image_array, 3, axis=2)
+
+        if rgb_image.dtype != np.uint8:
+            # Accept either 0-1 or 0-255 float inputs and convert to uint8 for PIL
+            if np.issubdtype(rgb_image.dtype, np.floating):
+                normalized = rgb_image
+                if normalized.max() <= 1.0:
+                    normalized = normalized * 255.0
+                rgb_image = np.clip(normalized, 0.0, 255.0).astype(np.uint8)
+            else:
+                rgb_image = np.clip(rgb_image, 0, 255).astype(np.uint8)
+        if rgb_image.max() <= 1:
+            rgb_image = np.clip(rgb_image * 255.0, 0.0, 255.0).astype(np.uint8)
+
+        Image.fromarray(rgb_image).save(filepath)
+        self._captured_snapshot = True
+        self._last_snapshot_path = filepath
 
     def _distance_to_target(self) -> float:
         state = self._getDroneStateVector(0)

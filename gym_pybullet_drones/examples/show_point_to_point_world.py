@@ -7,6 +7,7 @@ from typing import Optional
 import numpy as np
 
 from gym_pybullet_drones.envs.PointToPointAviary import PointToPointAviary
+from gym_pybullet_drones.utils.enums import ObservationType
 from gym_pybullet_drones.utils.utils import str2bool as utils_str2bool
 
 def run_demo(duration: float,
@@ -34,12 +35,16 @@ def run_demo(duration: float,
         max_xy=max_xy,
         max_z=max_z,
         target_tolerance=target_tolerance,
+        ctrl_freq=24,
+        obs=ObservationType.RGB,
         use_built_in_obstacles=True,
+        success_snapshot_dir=None,
         seed=seed,
     )
 
     obs, info = env.reset()
     print("[INFO] Initial target position:", info.get("target_position"))
+    print("[INFO] Direction hint:", info.get("direction_hint"))
 
     action = 0  # hover command from discrete set
     sim_start = time.time()
