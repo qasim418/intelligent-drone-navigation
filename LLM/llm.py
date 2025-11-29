@@ -28,32 +28,6 @@ DIRECTION_VECTORS = {
 # 2. NAVIGATOR (LLM-POWERED STORY PARSER)
 # ==============================================================================
 class Navigator:
-    @staticmethod
-    def suggest_escape_direction(lidar_hits, angle_range=None, min_clearance=2.0):
-        """
-        Given lidar_hits (list of distances), find the direction with the largest gap/clearance.
-        Assumes angles are evenly spaced from 0 to 2*pi.
-        Returns the angle (in radians) to move for escape, or None if no safe direction found.
-        Optionally restrict to angle_range (tuple: min, max in radians).
-        """
-        import math
-        if len(lidar_hits) == 0:
-            return None
-        num_rays = len(lidar_hits)
-        angles = [i * 2 * math.pi / num_rays for i in range(num_rays)]
-        # Filter for clear directions
-        safe = [(lidar_hits[i], angles[i]) for i in range(num_rays) if lidar_hits[i] > min_clearance]
-        if not safe:
-            # If no direction > min_clearance, use all directions and pick the best
-            safe = [(lidar_hits[i], angles[i]) for i in range(num_rays)]
-        if angle_range:
-            safe = [(dist, ang) for dist, ang in safe if angle_range[0] <= ang <= angle_range[1]]
-        if not safe:
-            return None
-        # Pick the direction with the maximum clearance
-        best = max(safe, key=lambda x: x[0])
-        return best[1]
-
     """
     Story-driven drone navigator using Gemini 2.0 Flash Lite.
     Forces waypoints to REACH THE BOUNDARY TARGET.
@@ -106,10 +80,6 @@ class Navigator:
         # Extract direction and calculate target
         temp_direction = self._extract_direction(story)
         target_pos = self._calculate_target(start_pos, temp_direction)
-        
-        # Set instance attributes for later use
-        self.temp_direction = temp_direction
-        self.target_pos = target_pos
         total_distance_to_target = np.linalg.norm(np.array(target_pos) - np.array(start_pos))
         
         print(f"[Navigator] Calculated target: {target_pos}")
@@ -596,7 +566,7 @@ def run_demo():
         p.disconnect()
         return
     
-    # Visualize path
+    # Visualize
     visualize_path(start_pos, waypoints, target_pos, direction, bounds)
     
     # Keep simulation running
