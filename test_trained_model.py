@@ -60,6 +60,17 @@ def test_model(
     print("\nCreating GUI environment...")
     env = RandomPointNavEnv(gui=True)
     
+    def add_path_marker(position, label="✓", color=[0, 1, 0]):
+        """Add a visual marker at the given position to show drone progress."""
+        # Add a small green sphere
+        vis_id = p.createVisualShape(p.GEOM_SPHERE, radius=0.2, rgbaColor=color + [0.8], physicsClientId=env.scene.client)
+        marker_id = p.createMultiBody(baseMass=0, baseVisualShapeIndex=vis_id, 
+                                      basePosition=position, physicsClientId=env.scene.client)
+        # Add text label slightly above
+        p.addUserDebugText(label, [position[0], position[1], position[2] + 0.5], 
+                           textColorRGB=color, textSize=0.5, physicsClientId=env.scene.client)
+        return marker_id
+    
     # Get mission story
     mission_story = input("Enter mission story: ").strip()
     if not mission_story:
@@ -72,43 +83,104 @@ def test_model(
     episode_lengths = []
 
     try:
-        # --- DYNAMIC WAYPOINTS (From LLM) ---
-        dynamic_waypoints = [[0.0, 0.0, 1.5]]  # Start position
+        # --- NEW: EXPLORATION-BASED WAYPOINT SYSTEM ---
+        # main_waypoints holds the LLM waypoints (straight line)
+        # Each main waypoint generates: [left, main, right, main] exploration sequence
+        main_waypoints = [[0.0, 0.0, 1.5]]  # Start position
+        current_main_wp_idx = 0
+        current_exploration_idx = 0
+        exploration_queue = []  # Will hold [left, main, right, main]
+        exploration_names = ["LEFT", "CENTER", "RIGHT", "CENTER"]
+        exploration_colors = [[1,0,0], [1,1,0], [1,0.5,0], [0,1,0]]  # red, yellow, orange, green
         
-        print(f"Starting with dynamic waypoints. Initial: {dynamic_waypoints}")
+        def get_next_exploration_target():
+            """Get the next target from exploration sequence, or None if done"""
+            nonlocal current_main_wp_idx, current_exploration_idx, exploration_queue
+            
+            # If no active exploration sequence, generate one
+            if not exploration_queue:
+                if current_main_wp_idx >= len(main_waypoints):
+                    return None  # All waypoints explored
+                
+                main_wp = main_waypoints[current_main_wp_idx]
+                exploration_queue = navigator.generate_exploration_sequence(main_wp)
+                current_exploration_idx = 0
+                print(f"\n{'='*60}")
+                print(f"🔍 EXPLORING MAIN WP {current_main_wp_idx + 1}/{len(main_waypoints)}")
+                print(f"Main WP: {main_wp}")
+                print(f"Exploration: [LEFT → CENTER → RIGHT → CENTER]")
+                print(f"{'='*60}")
+            
+            # Return current exploration point
+            target = exploration_queue[current_exploration_idx]
+            print(f"\n📍 Target: {exploration_names[current_exploration_idx]} → {target}")
+            return target
+        
+        def advance_exploration():
+            """Move to next exploration point. Returns True if more exist."""
+            nonlocal current_exploration_idx, exploration_queue, current_main_wp_idx
+            
+            current_exploration_idx += 1
+            
+            # If finished this exploration sequence
+            if current_exploration_idx >= len(exploration_queue):
+                print(f"\n✅ FINISHED Main WP {current_main_wp_idx + 1}")
+                current_main_wp_idx += 1
+                current_exploration_idx = 0
+                exploration_queue = []
+                
+                # Try to get next main waypoint segment from LLM
+                if current_main_wp_idx >= len(main_waypoints):
+                    # Ask LLM for next segment
+                    time.sleep(1)  # Rate limit
+                    next_segment = navigator.get_next_segment(drone_pos.tolist() if 'drone_pos' in locals() else [0,0,1.5])
+                    if next_segment:
+                        main_waypoints.extend(next_segment)
+                        print(f"→ Added LLM segment: {next_segment}")
+                        return True
+                    else:
+                        return False  # All done
+            
+            return True
 
+        # --- GET INITIAL LLM PATH BEFORE EPISODES ---
+        print("\n[Mission] Requesting initial path from LLM...")
+        initial_segment = navigator.get_next_segment([0.0, 0.0, 1.5])
+        
+        if not initial_segment:
+            print("ERROR: LLM failed to generate initial path. Aborting.")
+            return
+        
+        main_waypoints.extend(initial_segment)
+        print(f"[Mission] Initial path loaded: {len(initial_segment)} waypoints")
+        print(f"[Mission] Main waypoints: {main_waypoints}")
+        
         for episode in range(1, num_episodes + 1):
             obs = _unwrap_reset(env.reset())
             
-            # --- OVERRIDE: Force Start at First Waypoint ---
-            current_wp_idx = 0
-            start_pos = dynamic_waypoints[0]
-            
             # Move drone to start
+            start_pos = [0.0, 0.0, 1.5]
             p.resetBasePositionAndOrientation(env.scene.drone_id, start_pos, [0, 0, 0, 1], physicsClientId=env.scene.client)
             p.resetBaseVelocity(env.scene.drone_id, [0, 0, 0], [0, 0, 0], physicsClientId=env.scene.client)
+            add_path_marker(start_pos, "START", [0, 0, 1])  # Blue marker for start
             
-            # Get initial next segment
-            next_segment = navigator.get_next_segment(start_pos)
-            if next_segment:
-                dynamic_waypoints.extend(next_segment)
-                print(f"Initial segment added: {next_segment}")
+            # Reset exploration state for new episode
+            current_main_wp_idx = 0
+            current_exploration_idx = 0
+            exploration_queue = []
             
-            # Set initial target to next waypoint
-            target_wp_idx = 1
-            if target_wp_idx < len(dynamic_waypoints):
-                target_pos = np.array(dynamic_waypoints[target_wp_idx], dtype=np.float32)
-            else:
+            # Get initial target
+            target_pos = get_next_exploration_target()
+            if target_pos is None:
                 print("No waypoints available")
                 continue
             
-            # Update environment goal
-            env.goal_pos = target_pos
-            p.resetBasePositionAndOrientation(env.goal_id, target_pos.tolist(), [0, 0, 0, 1], physicsClientId=env.scene.client)
+            env.goal_pos = np.array(target_pos, dtype=np.float32)
+            p.resetBasePositionAndOrientation(env.goal_id, target_pos, [0, 0, 0, 1], physicsClientId=env.scene.client)
             
             print(f"\n--- Episode {episode}/{num_episodes} ---")
-            print(f"Current Target: Waypoint {target_wp_idx} -> {target_pos}")
-
+            print(f"Initial Target: {target_pos}")
+            
             # Frame counter for LIDAR overlay (update less frequently to avoid debug draw failures)
             frame_count = 0
             
@@ -116,67 +188,147 @@ def test_model(
             steps = 0
             terminated = truncated = False
             
+            # Stuck detection
+            stuck_counter = 0
+            prev_dist_to_wp = float('inf')
+            STUCK_THRESHOLD = 1000  # ~10 seconds of no progress
+            
+            # Path visualization
+            path_points = [start_pos.copy()]
+            last_path_draw_step = 0
+            
+            # Pause functionality
+            paused = False
+            print("Controls: SPACEBAR to pause/resume simulation")
+            
+            # --- Main Loop (Replace the entire while loop) ---
             while not (terminated or truncated) and steps < max_steps_per_episode:
-                # Update observation with new goal relative position
-                # We need to manually refresh the observation because we moved the goal/drone
-                obs = env._get_obs()
+                # Check for pause/resume (Spacebar)
+                keys = p.getKeyboardEvents()
+                if 32 in keys and keys[32] & p.KEY_WAS_TRIGGERED:  # Spacebar
+                    paused = not paused
+                    if paused:
+                        print("⏸️ SIMULATION PAUSED - Press SPACEBAR to resume")
+                    else:
+                        print("▶️ SIMULATION RESUMED")
                 
+                if paused:
+                    # Still update camera and LIDAR when paused
+                    if hasattr(env.scene, "_update_camera"):
+                        env.scene._update_camera()
+                    
+                    # Render LIDAR overlay when paused
+                    frame_count += 1
+                    if frame_count % 50 == 0:
+                        if hasattr(env.scene, "client") and env.scene.client is not None:
+                            try:
+                                pos, orn = p.getBasePositionAndOrientation(env.scene.drone_id, physicsClientId=env.scene.client)
+                                yaw = p.getEulerFromQuaternion(orn)[2]
+                                lidar_hits = env._get_lidar(pos, yaw)
+                                env.scene._render_lidar_overlay(pos, yaw, lidar_hits)
+                            except Exception:
+                                pass
+                    
+                    time.sleep(0.01)  # Small delay to prevent busy waiting
+                    continue
+                
+                obs = env._get_obs()
                 action, _ = model.predict(obs, deterministic=True)
                 obs, reward, terminated, truncated, info = _unwrap_step(env.step(action))
-
-                # Override termination for intermediate waypoints
-                if terminated and target_wp_idx < len(dynamic_waypoints) - 1:
-                    terminated = False
-
-                # Check if we reached the current waypoint (Custom check)
-                # The env might return 'terminated=True' if we are close to the CURRENT goal
-                # But we want to keep going until the FINAL goal
                 
+                # Override early termination
+                if terminated and current_main_wp_idx < len(main_waypoints) - 1:
+                    terminated = False
+                
+                # Get drone position and force altitude
                 drone_pos = np.array(p.getBasePositionAndOrientation(env.scene.drone_id, physicsClientId=env.scene.client)[0])
-                # Force altitude to 1.5m if deviated
                 if abs(drone_pos[2] - 1.5) > 0.1:
                     corrected_pos = [drone_pos[0], drone_pos[1], 1.5]
                     p.resetBasePositionAndOrientation(env.scene.drone_id, corrected_pos, [0, 0, 0, 1], physicsClientId=env.scene.client)
                     drone_pos = np.array(corrected_pos)
-                dist_to_wp = np.linalg.norm(drone_pos - target_pos)
                 
-                # Check if reached boundary (close to target)
+                # Update path visualization (draw line every 10 steps)
+                path_points.append(drone_pos.tolist())
+                if steps - last_path_draw_step >= 10 and len(path_points) >= 2:
+                    p.addUserDebugLine(path_points[-2], path_points[-1], [0, 1, 1], 2.0, lifeTime=0)  # Cyan line for drone path
+                    last_path_draw_step = steps
+                
+                # --- STUCK DETECTION ---
+                dist_to_wp = np.linalg.norm(drone_pos - target_pos)
+                if dist_to_wp < prev_dist_to_wp - 0.1:  # Making progress (>10cm)
+                    stuck_counter = 0
+                else:
+                    stuck_counter += 1
+                prev_dist_to_wp = dist_to_wp
+
+                # If stuck, consult LLM
+                if stuck_counter > STUCK_THRESHOLD:
+                    print(f"⚠️ STUCK for {stuck_counter} steps. Consulting LLM...")
+                    
+                    # Get LIDAR data
+                    pos, orn = p.getBasePositionAndOrientation(env.scene.drone_id, physicsClientId=env.scene.client)
+                    yaw = p.getEulerFromQuaternion(orn)[2]
+                    lidar_hits = env._get_lidar(pos, yaw)
+                    
+                    # Ask LLM
+                    decision = navigator.get_stuck_resolution(
+                        drone_pos.tolist(), 
+                        target_pos, 
+                        lidar_hits, 
+                        stuck_counter
+                    )
+                    
+                    # Execute LLM advice
+                    if decision.get("decision") == "skip":
+                        print("🤖 LLM: SKIP waypoint")
+                        if not advance_exploration():
+                            terminated = True
+                        else:
+                            target_pos = get_next_exploration_target()
+                            if target_pos is None:
+                                terminated = True
+                            else:
+                                env.goal_pos = np.array(target_pos, dtype=np.float32)
+                                p.resetBasePositionAndOrientation(env.goal_id, target_pos, [0, 0, 0, 1], physicsClientId=env.scene.client)
+                                stuck_counter = 0  # Reset
+                                prev_dist_to_wp = float('inf')
+                    elif decision.get("decision") == "abort":
+                        print("🤖 LLM: ABORT mission")
+                        terminated = True
+                    else:
+                        print("🤖 LLM: CONTINUE")
+                        stuck_counter = 0  # Reset and keep trying
+                
+                # Check if reached boundary target
                 dist_to_target = np.linalg.norm(drone_pos - navigator.target_pos)
                 if dist_to_target < 2.0:
-                    print(f"🎯 REACHED BOUNDARY at {drone_pos}! Target was {navigator.target_pos}")
-                    print("Pausing for 5 seconds...")
+                    print(f"🎯 REACHED FINAL BOUNDARY at {drone_pos}")
                     time.sleep(5)
                     terminated = True
                     continue
                 
+                # Check if reached current exploration point
+                dist_to_wp = np.linalg.norm(drone_pos - target_pos)
                 if dist_to_wp < 0.5:
-                    print(f"✓ Reached Waypoint {target_wp_idx} ({target_pos})")
+                    print(f"✓ Reached: {target_pos}")
+                    color = exploration_colors[current_exploration_idx]
+                    add_path_marker(target_pos, exploration_names[current_exploration_idx], color)
                     
-                    # Move to next waypoint
-                    target_wp_idx += 1
-                    if target_wp_idx >= len(dynamic_waypoints):
-                        # Try to get next segment
-                        time.sleep(1)  # Avoid API rate limits
-                        next_segment = navigator.get_next_segment(drone_pos.tolist())
-                        if next_segment:
-                            dynamic_waypoints.extend(next_segment)
-                            print(f"→ Added next segment: {next_segment}")
-                            target_pos = np.array(dynamic_waypoints[target_wp_idx], dtype=np.float32)
-                            env.goal_pos = target_pos
-                            p.resetBasePositionAndOrientation(env.goal_id, target_pos.tolist(), [0, 0, 0, 1], physicsClientId=env.scene.client)
-                            print(f"→ Next Target: Waypoint {target_wp_idx} -> {target_pos}")
-                        else:
-                            print("🎉 PATH COMPLETE!")
-                            terminated = True
+                    # Advance to next exploration point
+                    if not advance_exploration():
+                        print("🎉 ALL WAYPOINTS FULLY EXPLORED!")
+                        terminated = True
                     else:
-                        target_pos = np.array(dynamic_waypoints[target_wp_idx], dtype=np.float32)
-                        env.goal_pos = target_pos
-                        p.resetBasePositionAndOrientation(env.goal_id, target_pos.tolist(), [0, 0, 0, 1], physicsClientId=env.scene.client)
-                        print(f"→ Next Target: Waypoint {target_wp_idx} -> {target_pos}")
-                        
-                        # Prevent environment from terminating early
-                        terminated = False
-
+                        # Get next target
+                        target_pos = get_next_exploration_target()
+                        if target_pos is None:
+                            terminated = True
+                        else:
+                            env.goal_pos = np.array(target_pos, dtype=np.float32)
+                            p.resetBasePositionAndOrientation(env.goal_id, target_pos, [0, 0, 0, 1], physicsClientId=env.scene.client)
+                            print(f"→ Next Target: {target_pos}")
+                            terminated = False
+                
                 if hasattr(env.scene, "_update_camera"):
                     env.scene._update_camera()
                     
@@ -200,7 +352,7 @@ def test_model(
             episode_rewards.append(ep_reward)
             episode_lengths.append(steps)
             # Check if path is complete (no more segments available)
-            path_complete = (target_wp_idx >= len(dynamic_waypoints) and not navigator.get_next_segment(drone_pos.tolist()))
+            path_complete = (current_main_wp_idx >= len(main_waypoints) and not navigator.get_next_segment(drone_pos.tolist()))
             status = "SUCCESS" if path_complete else "TIMEOUT/CRASH"
             print(f"Reward: {ep_reward:.2f} | Steps: {steps} | Status: {status}")
             time.sleep(0.5)

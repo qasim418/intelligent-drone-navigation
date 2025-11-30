@@ -59,6 +59,81 @@ class Navigator:
         else:
             raise ValueError("[Navigator] No API key provided. Set GOOGLE_API_KEY environment variable.")
 
+    def generate_exploration_sequence(self, main_waypoint, search_width=3.0):
+        """
+        Generate exploration pattern [left, center, right, center] for a main waypoint
+        
+        Args:
+            main_waypoint: [x, y, z] - the main LLM waypoint
+            search_width: meters to offset left/right (default 3.0m)
+        
+        Returns:
+            list: 4 exploration waypoints
+        """
+        # Calculate left/right based on mission direction
+        if self.temp_direction in ["north", "south"]:
+            # For north/south, perpendicular is east/west (Y-axis)
+            left_wp = [main_waypoint[0], main_waypoint[1] - search_width, main_waypoint[2]]
+            right_wp = [main_waypoint[0], main_waypoint[1] + search_width, main_waypoint[2]]
+        else:
+            # For east/west and diagonals, perpendicular is X-axis or mixed
+            # Simple implementation: swap coordinates
+            if "east" in self.temp_direction:
+                left_wp = [main_waypoint[0] - search_width, main_waypoint[1], main_waypoint[2]]
+                right_wp = [main_waypoint[0] + search_width, main_waypoint[1], main_waypoint[2]]
+            else:
+                # Default fallback
+                left_wp = [main_waypoint[0], main_waypoint[1] - search_width, main_waypoint[2]]
+                right_wp = [main_waypoint[0], main_waypoint[1] + search_width, main_waypoint[2]]
+        
+        return [left_wp, main_waypoint, right_wp, main_waypoint]
+
+    def get_stuck_resolution(self, current_pos, target_pos, lidar_data, stuck_steps):
+        """
+        Ask LLM for advice when drone is stuck near an obstacle
+        
+        Args:
+            current_pos: [x, y, z] - current drone position
+            target_pos: [x, y, z] - target waypoint
+            lidar_data: list of LIDAR hit distances (sorted)
+            stuck_steps: int - how many steps stuck
+        
+        Returns:
+            dict: {"decision": "continue"|"skip"|"abort"}
+        """
+        # Analyze LIDAR for nearby obstacles
+        close_obstacles = [d for d in lidar_data[:5] if d < 2.0]  # First 5 rays, <2m
+        
+        prompt = f"""Drone emergency: STUCK near obstacle.
+
+Current: {current_pos}
+Target: {target_pos}
+Stuck: {stuck_steps} steps
+Obstacles: {len(close_obstacles)} within 2m (LIDAR: {close_obstacles[:3]})
+
+Cannot progress. Decision?
+
+Options:
+- "skip": Skip this waypoint (recommended if obstacle blocks path)
+- "abort": End mission
+- "continue": Keep trying
+
+Return ONLY JSON: {{"decision": "skip"}}"""
+        
+        try:
+            response = self.model.generate_content(prompt)
+            raw_text = response.text.strip()
+            
+            if raw_text.startswith("```"):
+                raw_text = raw_text.strip("`").replace("json", "").strip()
+            
+            result = json.loads(raw_text)
+            print(f"[LLM Decision] {result.get('decision', 'continue')}")
+            return result
+        except Exception as e:
+            print(f"[LLM Error] {e}, defaulting to skip")
+            return {"decision": "skip"}
+
     def plan_path(self, start_pos, story, num_waypoints=10):
         """
         Generate waypoints from natural language story that REACH THE BOUNDARY.
