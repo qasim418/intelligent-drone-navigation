@@ -70,7 +70,7 @@ Core runtime dependencies are listed in `requirements.txt` and include:
 Watch the full demo on YouTube: https://youtu.be/NllJUIectJA
 
 ## License
-Please specify the license governing the use and distribution of this project.
+This project is licensed under the MIT License. See the LICENSE file for details.
 
 ## Acknowledgments
 This project was completed as part of the "Fundamentals of AI Agents" course under the supervision of Prof. Ahmed Esmaeili. The work was conducted in collaboration with my teammates Mohammed Farhan and Mohammed Rizwan Raisulhaq. The project also acknowledges the contributions of open-source libraries and the broader academic community. 
