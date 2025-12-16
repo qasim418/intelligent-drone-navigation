@@ -32,7 +32,7 @@ except ImportError:
 SEED = 1234
 GUI_FPS = 240.0
 ARENA_RADIUS = 50.0  # 100x100 playable area (radius 50)
-SIMULATION_SPEED = 0.5  # Simulation speed multiplier (0.1 = 10x slower, 1.0 = real-time, 2.0 = 2x faster)
+SIMULATION_SPEED = 2.0  # Simulation speed multiplier (0.1 = 10x slower, 1.0 = real-time, 2.0 = 2x faster)
 
 NUM_TREES = 120
 NUM_BUSHES = 150

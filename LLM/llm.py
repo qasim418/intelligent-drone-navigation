@@ -4,11 +4,24 @@ import numpy as np
 import pybullet as p
 import pybullet_data
 from dotenv import load_dotenv
-import google.generativeai as genai
 import json
+try:
+    import requests
+except ImportError:
+    requests = None
 
 # Load environment variables
 load_dotenv()
+
+
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def _parse_csv_env(value: str) -> list:
+    if not value:
+        return []
+    parts = [p.strip() for p in value.split(",")]
+    return [p for p in parts if p]
 
 # ==============================================================================
 # 1. NAVIGATION CONSTANTS
@@ -29,35 +42,188 @@ DIRECTION_VECTORS = {
 # ==============================================================================
 class Navigator:
     """
-    Story-driven drone navigator using Gemini 2.0 Flash Lite.
+    Story-driven drone navigator using OpenRouter.
     Forces waypoints to REACH THE BOUNDARY TARGET.
     """
-    def __init__(self, api_key=None, bounds=50.0, waypoint_spacing=5.0):
-        self.bounds = bounds
-        self.spacing = waypoint_spacing
-        self.api_key = api_key
-        self.model = None
-        
     def __init__(self, api_key=None, bounds=50.0, waypoint_spacing=5.0, story=""):
         self.bounds = bounds
         self.spacing = waypoint_spacing
         self.api_key = api_key
-        self.model = None
         self.story = story
-        
-        if self.api_key:
-            genai.configure(api_key=self.api_key)
-            self.model = genai.GenerativeModel('gemini-2.0-flash-lite')
-            print(f"[Navigator] Initialized with Gemini 2.0 Flash Lite")
-            print(f"[Navigator] Bounds: ±{bounds}m | Target spacing: {waypoint_spacing}m")
-            
-            if story:
-                self.temp_direction = self._extract_direction(story)
-                self.target_pos = self._calculate_target([0.0, 0.0, 1.0], self.temp_direction)
-                print(f"[Navigator] Story: {story}")
-                print(f"[Navigator] Direction: {self.temp_direction} | Target: {self.target_pos}")
+        self.temp_direction = self._extract_direction(story) if story else "north"
+        self.target_pos = self._calculate_target([0.0, 0.0, 1.5], self.temp_direction)
+        self.static_waypoints = self._build_static_library()
+        self.provider = "static"
+
+        # OpenRouter backend (Qwen3 4B).
+        # Priority: explicit api_key arg -> OPENROUTER_API_KEY -> GOOGLE_API_KEY (back-compat with existing scripts).
+        self.openrouter_api_key = (api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+        # Override via OPENROUTER_MODEL.
+        # NOTE: Some model IDs change over time; if you see 404s from OpenRouter, set OPENROUTER_MODEL explicitly.
+        self.openrouter_model = (os.getenv("OPENROUTER_MODEL") or "google/gemma-3-4b-it").strip()
+        self.openrouter_model_fallbacks = _parse_csv_env(os.getenv("OPENROUTER_MODEL_FALLBACKS") or "")
+        self.openrouter_site_url = (os.getenv("OPENROUTER_SITE_URL") or "").strip()
+        self.openrouter_app_title = (os.getenv("OPENROUTER_APP_TITLE") or "").strip()
+
+        if self.openrouter_api_key:
+            if requests is None:
+                print("[Navigator] 'requests' is not installed; cannot call OpenRouter. Falling back to static mode.")
+            else:
+                self.provider = "openrouter"
+                if self.openrouter_model_fallbacks:
+                    print(
+                        "[Navigator] Initialized with OpenRouter model "
+                        f"{self.openrouter_model} (fallbacks: {', '.join(self.openrouter_model_fallbacks)})"
+                    )
+                else:
+                    print(f"[Navigator] Initialized with OpenRouter model {self.openrouter_model}")
+                print(f"[Navigator] Bounds: ±{bounds}m | Target spacing: {waypoint_spacing}m")
+                if story:
+                    print(f"[Navigator] Story: {story}")
+                    print(f"[Navigator] Direction: {self.temp_direction} | Target: {self.target_pos}")
         else:
-            raise ValueError("[Navigator] No API key provided. Set GOOGLE_API_KEY environment variable.")
+            print("[Navigator] No OpenRouter API key detected; running in static waypoint mode.")
+
+    def _generate_static_chain(self, direction: str, steps: int = 10, altitude: float = 1.5):
+        """Create deterministic waypoint chain along given compass direction."""
+        vec = np.array(DIRECTION_VECTORS.get(direction.lower(), [1, 0, 0]), dtype=np.float32)
+        norm = np.linalg.norm(vec[:2]) or 1.0
+        step = (vec[:2] / norm) * self.spacing
+        origin = np.array([0.0, 0.0], dtype=np.float32)
+        chain = []
+        current = origin.copy()
+        for _ in range(steps):
+            current = current + step
+            clipped = np.clip(current, -self.bounds, self.bounds)
+            chain.append([float(clipped[0]), float(clipped[1]), float(altitude)])
+        return chain
+
+    def _build_static_library(self, steps: int = 10):
+        """Precompute static waypoint banks for all compass directions."""
+        library = {}
+        for name in DIRECTION_VECTORS.keys():
+            library[name] = self._generate_static_chain(name, steps)
+        return library
+
+    def get_static_waypoints(self, direction: str, steps: int = 10, altitude: float = 1.5):
+        """Retrieve predefined waypoints without issuing LLM calls."""
+        direction = (direction or "north").lower()
+        cached_steps = len(next(iter(self.static_waypoints.values()))) if self.static_waypoints else 0
+        if steps != cached_steps or altitude != 1.5:
+            return self._generate_static_chain(direction, steps, altitude)
+        if direction not in self.static_waypoints:
+            direction = "north"
+        # Return copy to avoid caller mutation
+        return [wp.copy() for wp in self.static_waypoints[direction]]
+
+    def _can_call_llm(self) -> bool:
+        return self.provider == "openrouter" and bool(self.openrouter_api_key) and requests is not None
+
+    def _invoke_llm(self, prompt: str) -> str:
+        if self.provider != "openrouter" or not self.openrouter_api_key or requests is None:
+            raise RuntimeError("No LLM backend configured.")
+
+        headers = {
+            "Authorization": f"Bearer {self.openrouter_api_key}",
+            "Content-Type": "application/json",
+        }
+        if self.openrouter_site_url:
+            headers["HTTP-Referer"] = self.openrouter_site_url
+        if self.openrouter_app_title:
+            headers["X-Title"] = self.openrouter_app_title
+
+        base_payload = {
+            "messages": [{"role": "user", "content": prompt.strip()}],
+            "temperature": 0.2,
+            "max_tokens": 1024,
+        }
+
+        models_to_try = [m for m in [self.openrouter_model, *self.openrouter_model_fallbacks] if m]
+        if not models_to_try:
+            raise RuntimeError("No OpenRouter model configured.")
+
+        last_err = None
+        for model_name in models_to_try:
+            payload = dict(base_payload)
+            payload["model"] = model_name
+
+            # Retry on HTTP 429 with exponential backoff to avoid failing the whole run.
+            for attempt in range(6):
+                try:
+                    resp = requests.post(OPENROUTER_API_URL, headers=headers, data=json.dumps(payload), timeout=60)
+                except Exception as exc:
+                    last_err = exc
+                    time.sleep(min(10.0, 1.0 + attempt))
+                    continue
+
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    try:
+                        retry_s = float(retry_after) if retry_after is not None else None
+                    except Exception:
+                        retry_s = None
+                    if retry_s is None:
+                        retry_s = min(30.0, 1.0 * (2 ** attempt))
+                    last_err = RuntimeError(f"OpenRouter rate limited (429) for {model_name}: {resp.text[:200]}")
+                    time.sleep(retry_s)
+                    continue
+
+                # 402/403 can happen if a model is paid and the key has no credits/permission.
+                if resp.status_code in (402, 403):
+                    last_err = RuntimeError(f"OpenRouter access error {resp.status_code} for {model_name}: {resp.text[:200]}")
+                    break  # try next model
+
+                # 404 often means the model name is invalid or temporarily unavailable.
+                if resp.status_code == 404:
+                    last_err = RuntimeError(f"OpenRouter HTTP 404 for {model_name}: {resp.text[:200]}")
+                    break  # try next model
+
+                if resp.status_code < 200 or resp.status_code >= 300:
+                    raise RuntimeError(f"OpenRouter HTTP {resp.status_code} for {model_name}: {resp.text[:300]}")
+
+                data = resp.json()
+                break
+            else:
+                # exhausted retries for this model; try the next one
+                continue
+
+            # If we got a successful response, stop trying models.
+            if 'data' in locals():
+                break
+        else:
+            raise RuntimeError(f"OpenRouter unavailable after retries and fallbacks: {str(last_err)[:300]}")
+
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except Exception:
+            raise RuntimeError(f"Unexpected OpenRouter response schema: {str(data)[:300]}")
+        return (content or "").strip()
+
+    def _fallback_segment(self, start_pos, direction_vec, count: int) -> list:
+        """Generate a deterministic segment when LLM calls fail (e.g., rate-limited)."""
+        if not start_pos or len(start_pos) < 3:
+            return []
+        x0, y0, z0 = float(start_pos[0]), float(start_pos[1]), float(start_pos[2])
+        dx, dy = float(direction_vec[0]), float(direction_vec[1])
+        norm = (dx * dx + dy * dy) ** 0.5
+        if norm == 0.0:
+            return []
+        dx /= norm
+        dy /= norm
+
+        waypoints = []
+        prev = None
+        for i in range(1, int(count) + 1):
+            x = x0 + dx * self.spacing * i
+            y = y0 + dy * self.spacing * i
+            x = float(np.clip(x, -self.bounds, self.bounds))
+            y = float(np.clip(y, -self.bounds, self.bounds))
+            wp = [x, y, float(z0)]
+            if prev is not None and (abs(wp[0] - prev[0]) < 1e-6 and abs(wp[1] - prev[1]) < 1e-6):
+                break
+            waypoints.append(wp)
+            prev = wp
+        return waypoints
 
     def generate_exploration_sequence(self, main_waypoint, search_width=3.0):
         """
@@ -70,22 +236,46 @@ class Navigator:
         Returns:
             list: 4 exploration waypoints
         """
-        # Calculate left/right based on mission direction
-        if self.temp_direction in ["north", "south"]:
-            # For north/south, perpendicular is east/west (Y-axis)
-            left_wp = [main_waypoint[0], main_waypoint[1] - search_width, main_waypoint[2]]
-            right_wp = [main_waypoint[0], main_waypoint[1] + search_width, main_waypoint[2]]
-        else:
-            # For east/west and diagonals, perpendicular is X-axis or mixed
-            # Simple implementation: swap coordinates
-            if "east" in self.temp_direction:
-                left_wp = [main_waypoint[0] - search_width, main_waypoint[1], main_waypoint[2]]
-                right_wp = [main_waypoint[0] + search_width, main_waypoint[1], main_waypoint[2]]
-            else:
-                # Default fallback
-                left_wp = [main_waypoint[0], main_waypoint[1] - search_width, main_waypoint[2]]
-                right_wp = [main_waypoint[0], main_waypoint[1] + search_width, main_waypoint[2]]
-        
+        # Compute a perpendicular (lateral) offset to the mission direction.
+        # NOTE: In this project coordinate system: +X is NORTH, +Y is EAST.
+        direction_text = (self.temp_direction or "").lower().replace("_", "-").replace(" ", "-")
+
+        forward_x = 0.0
+        forward_y = 0.0
+        if "north" in direction_text:
+            forward_x += 1.0
+        if "south" in direction_text:
+            forward_x -= 1.0
+        if "east" in direction_text:
+            forward_y += 1.0
+        if "west" in direction_text:
+            forward_y -= 1.0
+
+        # Fallback if the direction label is missing/unknown.
+        if forward_x == 0.0 and forward_y == 0.0:
+            forward_x, forward_y = 1.0, 0.0
+
+        norm = (forward_x ** 2 + forward_y ** 2) ** 0.5
+        forward_x /= norm
+        forward_y /= norm
+
+        # Perpendicular unit vector (90 degrees in the XY plane).
+        # We use +/- perp for left/right exploration; exact handedness is not important,
+        # only that offsets are lateral to the forward direction.
+        perp_x = -forward_y
+        perp_y = forward_x
+
+        left_wp = [
+            main_waypoint[0] + perp_x * search_width,
+            main_waypoint[1] + perp_y * search_width,
+            main_waypoint[2],
+        ]
+        right_wp = [
+            main_waypoint[0] - perp_x * search_width,
+            main_waypoint[1] - perp_y * search_width,
+            main_waypoint[2],
+        ]
+
         return [left_wp, main_waypoint, right_wp, main_waypoint]
 
     def get_stuck_resolution(self, current_pos, target_pos, lidar_data, stuck_steps):
@@ -101,6 +291,8 @@ class Navigator:
         Returns:
             dict: {"decision": "continue"|"skip"|"abort"}
         """
+        if not self._can_call_llm():
+            return {"decision": "continue"}
         # Analyze LIDAR for nearby obstacles
         close_obstacles = [d for d in lidar_data[:5] if d < 2.0]  # First 5 rays, <2m
         
@@ -121,8 +313,7 @@ Options:
 Return ONLY JSON: {{"decision": "skip"}}"""
         
         try:
-            response = self.model.generate_content(prompt)
-            raw_text = response.text.strip()
+            raw_text = self._invoke_llm(prompt)
             
             if raw_text.startswith("```"):
                 raw_text = raw_text.strip("`").replace("json", "").strip()
@@ -156,9 +347,16 @@ Return ONLY JSON: {{"decision": "skip"}}"""
         temp_direction = self._extract_direction(story)
         target_pos = self._calculate_target(start_pos, temp_direction)
         total_distance_to_target = np.linalg.norm(np.array(target_pos) - np.array(start_pos))
+        self.temp_direction = temp_direction
+        self.target_pos = target_pos
         
         print(f"[Navigator] Calculated target: {target_pos}")
         print(f"[Navigator] Total distance to target: {total_distance_to_target:.2f}m")
+        
+        if not self._can_call_llm():
+            static_path = self.get_static_waypoints(temp_direction, steps=num_waypoints, altitude=start_pos[2])
+            print(f"[Navigator] Static mode active. Returning {len(static_path)} predefined waypoints for {temp_direction} direction.")
+            return static_path, target_pos, temp_direction
         
         # Segment-based planning: generate waypoints in 20m segments
         waypoints = []
@@ -220,8 +418,7 @@ RULES:
             print(f"\n[Navigator] Segment {segment_count + 1}: Planning {segment_dist:.1f}m from {current_pos}")
             
             try:
-                response = self.model.generate_content(prompt)
-                raw_text = response.text.strip()
+                raw_text = self._invoke_llm(prompt)
                 
                 print(f"[DEBUG] Segment {segment_count + 1} response:")
                 print(raw_text[:200] + "..." if len(raw_text) > 200 else raw_text)
@@ -265,8 +462,7 @@ RULES:
                 print(f"[Navigator] Retrying segment {segment_count + 1}...")
                 # Retry once
                 try:
-                    response = self.model.generate_content(prompt)
-                    raw_text = response.text.strip()
+                    raw_text = self._invoke_llm(prompt)
                     
                     print(f"[DEBUG] Retry Segment {segment_count + 1} response:")
                     print(raw_text[:200] + "..." if len(raw_text) > 200 else raw_text)
@@ -315,6 +511,13 @@ RULES:
 
     def get_next_segment(self, current_pos):
         """Generate next 20m segment from current position towards target."""
+        if not self._can_call_llm():
+            # Keep the mission running even without LLM access.
+            vec = DIRECTION_VECTORS.get(self.temp_direction, [1, 0, 0])
+            remaining = np.linalg.norm(np.array(self.target_pos) - np.array(current_pos)) if hasattr(self, 'target_pos') else 0.0
+            segment_dist = min(float(remaining), float(remaining))
+            num_wp = max(2, int(segment_dist / self.spacing) + 1) if segment_dist > 0 else 2
+            return self._fallback_segment(current_pos, vec, num_wp)
         if not hasattr(self, 'target_pos'):
             return []
         
@@ -392,8 +595,7 @@ RULES:
             print(prompt)
             
             try:
-                response = self.model.generate_content(prompt)
-                raw_text = response.text.strip()
+                raw_text = self._invoke_llm(prompt)
                 
                 print(f"[LLM Output] Attempt {attempt + 1}:")
                 print(raw_text)
@@ -425,6 +627,16 @@ RULES:
                     
             except Exception as e:
                 print(f"[Navigator] Failed to get next segment on attempt {attempt + 1}: {e}")
+
+                # If the backend is rate-limited/unavailable, fall back to deterministic waypoints
+                # instead of aborting the entire mission run.
+                msg = str(e).lower()
+                if "rate limited" in msg or "429" in msg:
+                    vec = DIRECTION_VECTORS.get(self.temp_direction, [1, 0, 0])
+                    fallback = self._fallback_segment(current_pos, vec, num_wp)
+                    if fallback:
+                        print("[Navigator] Using fallback waypoints due to rate limiting.")
+                        return fallback
         
         print("[Navigator] All attempts failed, returning empty segment")
         return []
@@ -591,9 +803,9 @@ def visualize_path(start, waypoints, target, direction, bounds):
 def run_demo():
     """Execute story-driven navigation mission."""
     # API Key setup
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        print("ERROR: Set GOOGLE_API_KEY in .env file")
+    openrouter_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not openrouter_key:
+        print("ERROR: Set OPENROUTER_API_KEY in .env file")
         return
     
     # PyBullet setup
@@ -614,7 +826,7 @@ def run_demo():
         print(f"Using default story: {mission_story}")
     
     # Initialize Navigator
-    navigator = Navigator(api_key=api_key, bounds=bounds, waypoint_spacing=5.0)
+    navigator = Navigator(api_key=openrouter_key, bounds=bounds, waypoint_spacing=5.0)
     
     # Generate path from story
     print("\n" + "🚁"*35)

@@ -1,0 +1,50 @@
+
+=== DQN UAV Navigation Training Summary ===
+Timestamp: 20251209_145616
+Total Timesteps: 33,043
+Total Iterations: 1,000,000
+
+HYPERPARAMETERS:
+- Learning Rate: 0.0001
+- Replay Buffer Size: 200,000
+- Batch Size: 256
+- Discount Factor (Gamma): 0.99
+- Target Update Frequency: 250
+- Action Repetitions: 4
+
+ENVIRONMENT CONFIG:
+- Arena Radius: 50.0m
+- Waypoint Distance Range: 5.0m - 15.0m
+- Arrival Tolerance: 0.5m
+- Hazard Proximity Threshold: 1.0m
+- LiDAR Beams: 36
+- Detection Range: 2.0m
+- Cruise Speed: 3.0m/s
+
+REWARD STRUCTURE:
+- Crash Penalty: -15.0
+- Waypoint Bonus: 20.0
+- Hazard Penalty: -0.5
+
+OUTPUTS:
+- Model: training_sessions\20251209_145616\final_model_20251209_145616.zip
+- TensorBoard Logs: training_sessions\20251209_145616\tensorboard
+- Checkpoints: training_sessions\20251209_145616\snapshots
+- Evaluations: training_sessions\20251209_145616\evaluations
+
+TENSORBOARD METRICS TO TRACK:
+1. metrics/frames_per_sec - Training throughput
+2. metrics/training_progress_percent - Training progress
+3. learning/exploration_rate - Epsilon schedule
+4. learning/replay_buffer_size - Experience buffer utilization
+5. training/policy_loss - Policy network loss
+6. environment/waypoint_distance - Distance to target
+7. eval/mean_reward - Evaluation mean reward
+8. eval/success_rate - Task success rate (if tracked)
+
+To view training progress:
+  tensorboard --logdir=training_sessions\20251209_145616\tensorboard
+
+To load trained model:
+  from stable_baselines3 import DQN
+  model = DQN.load("training_sessions\20251209_145616\final_model_20251209_145616")
